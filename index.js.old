@@ -1,0 +1,1278 @@
+import crypto from "crypto";
+import express from "express";
+import mysql from "mysql";
+import path from "path";
+import session from "express-session";
+import passport from "passport";
+import { Strategy } from "passport-local";
+import { Strategy as GoogleStrategy } from "passport-google-oauth2";
+import FacebookStrategy from "passport-facebook";
+import env from "dotenv";
+import winston from "winston";
+import DailyRotateFile from "winston-daily-rotate-file";
+import morgan from "morgan";
+import fs from "fs";
+import { connectToServer, getDb, closeDb } from "./public/js/db.js";
+
+import { fileURLToPath } from "node:url";
+import { dirname } from "node:path";
+import { stat } from "node:fs";
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+
+env.config({ path: path.resolve(__dirname, ".env") }); // ✅ MUST BE FIRST
+console.log(__filename);
+//const __dirname = path.resolve();
+console.log(__dirname);
+
+const app = express();
+const port = 3000;
+
+const pool = mysql.createPool({
+  host: process.env.DB_MYSQL_HOST,
+  user: process.env.DB_MYSQL_USER,
+  password: process.env.DB_MYSQL_PASS,
+  database: process.env.DB_MYSQL_DATABASE,
+  connectionLimit: 10,
+});
+
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+
+app.use(
+  session({
+    secret: process.env.SESSION_SECRET,
+    resave: false,
+    saveUninitialized: false,
+    cookie: {
+      maxAge: 24 * 60 * 60 * 1000, // 1 day
+    },
+  }),
+);
+
+// write logic to wtore request and response info to mongodb
+
+// Custom logging middleware
+function generateShortId() {
+  return `REQ-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
+}
+
+app.use(async (req, res, next) => {
+  const startHrTime = process.hrtime();
+  const customId = generateShortId(); // Generate your memorable ID
+
+  // Capture request details
+  const logData = {
+    _id: customId,
+    method: req.method,
+    url: req.url,
+    headers: req.headers,
+    body: req.body,
+    timestamp: new Date(),
+  };
+
+  // Modify the response.send method to capture response details
+  const originalSend = res.send;
+  res.send = function (body) {
+    const elapsedHrTime = process.hrtime(startHrTime);
+    const elapsedTimeInMs = (
+      elapsedHrTime[0] * 1000 +
+      elapsedHrTime[1] / 1e6
+    ).toFixed(3);
+
+    logData.response = {
+      _id: customId,
+      statusCode: res.statusCode,
+      body: body,
+      responseTimeMs: elapsedTimeInMs,
+    };
+
+    // Insert log data into MongoDB
+    // const dbConnection = getDb();
+    // dbConnection
+    //   .collection("request_logs")
+    //   .insertOne(logData)
+    //   .then(() => console.log("Request/Response logged to MongoDB"))
+    //   .catch((err) => console.error("Failed to log to MongoDB", err));
+
+    originalSend.call(res, body);
+  };
+
+  // Insert log data into MongoDB
+  res.on("finish", () => {
+    const dbConnection = getDb();
+    dbConnection
+      .collection("request_logs")
+      .insertOne(logData)
+      .then(() => console.log("Request/Response logged to MongoDB"))
+      .catch((err) => console.error("Failed to log to MongoDB", err));
+  });
+
+  next();
+});
+
+// middlewares/checkPermission.js
+export const checkPermission = (permissionName) => {
+  return (req, res, next) => {
+    if (!req.isAuthenticated()) {
+      return res.status(401).json({ message: "Unauthorized" });
+    }
+
+    const userId = req.user.user_id;
+
+    const sql = `
+      SELECT p.name
+      FROM permission p
+      JOIN role_permission rp ON rp.permission_id = p.id
+      JOIN user_role ur ON ur.role_id = rp.role_id
+      join userregistration u on u.id=ur.user_id
+      WHERE u.user_id = ? AND p.name = ?
+    `;
+
+    req.db.query(sql, [userId, permissionName], (err, result) => {
+      if (err) {
+        return res.status(500).json({ message: "Permission check failed" });
+      }
+
+      if (result[0].count === 0) {
+        return res.status(403).json({ message: "Access denied" });
+      }
+
+      next();
+    });
+  };
+};
+
+app.use(passport.initialize());
+app.use(passport.session());
+app.use((req, res, next) => {
+  req.db = pool;
+  next();
+});
+
+app.use(async (req, res, next) => {
+  if (req.isAuthenticated()) {
+    next();
+  } else {
+    if (
+      req.url != "/login.html" &&
+      req.url !== "/Registration.html" &&
+      (req.url.endsWith(".html") || req.url === "/")
+    ) {
+      res.redirect("/login.html");
+    } else {
+      next();
+    }
+  }
+  //check if authenticated; if not redirect to /login.html
+});
+
+app.get("/logout", (req, res, next) => {
+  req.logout((err) => {
+    if (err) return next(err);
+
+    req.session.destroy(() => {
+      res.redirect("/login.html");
+    });
+  });
+});
+
+app.post("/login", (req, res, next) => {
+  passport.authenticate("local", (err, user, info) => {
+    if (err) {
+      return res.status(500).json({ message: "Server error" });
+    }
+
+    if (!user) {
+      return res.status(401).json({
+        message: "Invalid credentials please Register",
+      });
+    }
+
+    req.logIn(user, (err) => {
+      if (err) {
+        return res.status(500).json({ message: "Login error" });
+      }
+
+      return res.status(200).json({
+        message: "Login successful",
+      });
+    });
+  })(req, res, next);
+});
+
+app.get(
+  "/auth/google",
+  passport.authenticate("google", { scope: ["profile", "email"] }),
+);
+
+app.get(
+  "/auth/google/secrets",
+  passport.authenticate("google", { failureRedirect: "/login.html" }),
+  (req, res) => {
+    res.cookie("auth", Date.now(), {
+      maxAge: 24 * 60 * 60 * 1000,
+      httpOnly: false, // ❌ less secure
+      path: "/",
+    });
+    res.redirect("/home-Page.html");
+  },
+);
+
+passport.use(
+  "local",
+  new Strategy(
+    {
+      usernameField: "user_id",
+      passwordField: "password",
+      passReqToCallback: true,
+    },
+    (req, user_id, password, cb) => {
+      try {
+        const hash = crypto.createHash("sha512").update(password).digest("hex");
+
+        req.db.query(
+          "SELECT * FROM userregistration WHERE user_id = ? AND password = ?",
+          [user_id, hash],
+          (err, results) => {
+            if (err) return cb(err);
+            if (!results.length)
+              return cb(null, false, {
+                message: "Invalid credentials please Register",
+              });
+
+            return cb(null, results[0]);
+          },
+        );
+      } catch (err) {
+        return cb(err);
+      }
+    },
+  ),
+);
+
+passport.use(
+  "google",
+  new GoogleStrategy(
+    {
+      clientID: process.env.GOOGLE_CLIENT_ID,
+      clientSecret: process.env.GOOGLE_CLIENT_SECRET,
+      callbackURL: "/auth/google/secrets",
+      passReqToCallback: true, // ✅ IMPORTANT
+    },
+    (req, accessToken, refreshToken, profile, done) => {
+      const userId = profile.id;
+      const email = profile.email || "";
+      const loginType = "google";
+
+      const user = {
+        user_id: userId,
+        email_id: email,
+        login_type: loginType,
+      };
+
+      // ✅ SET SESSION HERE
+      req.session.userId = user.user_id;
+      req.session.email = user.email_id;
+      req.session.loginType = user.login_type;
+      req.session.userSavedInDb = false;
+
+      /*
+
+      if valid profile.email is available, save session
+
+      try to insert user into db
+      if error in db insert, save in session that user is not saved; otherwise save in session that user in db is updated
+      call done when all work is done
+
+
+      */
+
+      try {
+        req.db.query(
+          "SELECT * FROM userregistration WHERE email_id = ?",
+          [email],
+          (err, results) => {
+            if (err) {
+              req.session.userSavedInDb = false;
+              req.session.save(() => {
+                return done(null, user);
+              });
+            }
+            // ✅ NEW USER
+            if (results.length === 0) {
+              req.db.query(
+                "INSERT INTO userregistration (user_id, email_id, password,login_type) VALUES (?, ?, ?,?)",
+                [userId, email, null, loginType],
+                (err) => {
+                  if (err) {
+                    req.session.userSavedInDb = false;
+                  } else {
+                    req.session.userSavedInDb = true;
+                  }
+                  req.session.save(() => {
+                    return done(null, user);
+                  });
+                },
+              );
+            }
+            // ✅ EXISTING USER
+            else {
+              // ✅ SET SESSION HERE
+              req.session.userSavedInDb = true;
+
+              req.session.save(() => {
+                return done(null, user);
+              });
+            }
+          },
+        );
+      } catch (error) {
+        let x = error;
+        req.session.userSavedInDb = false;
+        req.session.save(() => {
+          return done(null, user);
+        });
+      }
+    },
+  ),
+);
+
+app.get(
+  "/auth/facebook",
+  passport.authenticate("facebook", { scope: ["public_profile"] }),
+);
+
+app.get(
+  "/auth/facebook/callback",
+  passport.authenticate("facebook", { failureRedirect: "/login.html" }),
+  (req, res) => {
+    res.cookie("auth", Date.now(), {
+      maxAge: 24 * 60 * 60 * 1000,
+      httpOnly: false,
+      path: "/",
+    });
+    res.redirect("/home-Page.html");
+  },
+);
+
+passport.use(
+  "facebook",
+  new FacebookStrategy(
+    {
+      clientID: process.env.FACEBOOK_APP_ID,
+      clientSecret: process.env.FACEBOOK_SECRET_ID,
+      callbackURL: "/auth/facebook/callback",
+      profileFields: ["id", "displayName"],
+      passReqToCallback: true,
+    },
+    (req, accessToken, refreshToken, profile, done) => {
+      const userId = profile.id;
+      const name = profile.displayName || null;
+      const loginType = "facebook";
+
+      const user = {
+        user_id: userId,
+        User_name: name,
+        login_type: loginType,
+      };
+
+      req.session.userId = user.user_id;
+      req.session.name = user.User_name;
+      req.session.loginType = user.login_type;
+      req.session.userSavedInDb = false;
+
+      try {
+        req.db.query(
+          "SELECT * FROM userregistration WHERE name = ?",
+          [name],
+          (err, results) => {
+            if (err) {
+              req.session.userSavedInDb = false;
+              req.session.save(() => {
+                return done(null, user);
+              });
+            }
+
+            // 🆕 New user
+            if (results.length === 0) {
+              req.db.query(
+                "INSERT INTO userregistration (user_id, password, login_type,name) VALUES (?,?, ?, ?)",
+                [userId, null, loginType, name],
+                (err) => {
+                  if (err) {
+                    req.session.userSavedInDb = false;
+                  } else {
+                    req.session.userSavedInDb = true;
+                  }
+                  req.session.save(() => {
+                    return done(null, user);
+                  });
+                },
+              );
+            } else {
+              req.session.userSavedInDb = true;
+
+              req.session.save(() => {
+                return done(null, user);
+              });
+            }
+          },
+        );
+      } catch (error) {
+        req.session.userSavedInDb = false;
+        req.session.save(() => {
+          return done(null, user);
+        });
+      }
+    },
+  ),
+);
+
+app.use(express.static(path.join(__dirname, "public")));
+
+passport.serializeUser((user, cb) => {
+  cb(null, user.user_id);
+});
+
+passport.deserializeUser((id, cb) => {
+  // todo ... what 's the purpose of deserializeUser
+  cb(null, { user_id: id });
+
+  // req.db.query(
+  //   "SELECT * FROM userregistration WHERE user_id = ?",
+  //   [id],
+  //   (err, results) => {
+  //     if (err) return cb(err);
+  //     cb(null, results[0]);
+  //   },
+  // );
+});
+
+app.use(async (req, res, next) => {
+  try {
+    // Borrow a connection from the pool
+    pool.getConnection((err, connection) => {
+      if (err) {
+        console.error("Error getting connection from pool:", err);
+        res.status(500).send("Database connection error");
+      } else {
+        req.db = connection;
+        // Return the connection to the pool when the response is finished
+        res.on("finish", () => req.db.release());
+        res.on("close", () => req.db.release());
+        next();
+      }
+    });
+  } catch (error) {
+    console.error("Pool connection error:", error);
+    res.status(500).send("Database connection pool error");
+  }
+});
+
+const logDir = path.join(process.cwd(), "logs");
+if (!fs.existsSync(logDir)) {
+  fs.mkdirSync(logDir);
+}
+const logFormat = winston.format.combine(
+  winston.format.timestamp({ format: "YYYY-MM-DD HH:mm:ss" }),
+  winston.format.errors({ stack: true }),
+  winston.format.json(),
+);
+
+export const logger = winston.createLogger({
+  level: process.env.LOG_LEVEL || "debug",
+  format: logFormat,
+  defaultMeta: { service: "billing-app" },
+  transports: [
+    // 🔹 Console (all levels)
+    new winston.transports.Console({
+      level: "debug",
+      format: winston.format.combine(
+        winston.format.colorize(),
+        winston.format.simple(),
+      ),
+    }),
+
+    // 🔹 Debug logs
+    new DailyRotateFile({
+      filename: path.join(logDir, "debug-%DATE%.log"),
+      datePattern: "YYYY-MM-DD",
+      level: "debug",
+      maxSize: "10m",
+      maxFiles: "7d",
+    }),
+
+    // 🔹 Warning logs
+    new DailyRotateFile({
+      filename: path.join(logDir, "warn-%DATE%.log"),
+      datePattern: "YYYY-MM-DD",
+      level: "warn",
+      maxSize: "10m",
+      maxFiles: "14d",
+    }),
+
+    // 🔹 Info logs
+    new DailyRotateFile({
+      filename: path.join(logDir, "app-%DATE%.log"),
+      datePattern: "YYYY-MM-DD",
+      level: "info",
+      maxSize: "10m",
+      maxFiles: "14d",
+    }),
+
+    // 🔹 Error logs
+    new DailyRotateFile({
+      filename: path.join(logDir, "error-%DATE%.log"),
+      datePattern: "YYYY-MM-DD",
+      level: "error",
+      maxSize: "10m",
+      maxFiles: "30d",
+    }),
+  ],
+  exitOnError: false,
+});
+
+export const httpLogger = morgan(
+  ":method :url :status :res[content-length] - :response-time ms",
+  {
+    stream: {
+      write: (message) => logger.info(message.trim()),
+    },
+  },
+);
+app.use(httpLogger);
+
+export const errorLogger = (err, req, res, next) => {
+  logger.error({
+    message: err.message,
+    stack: err.stack,
+    url: req.originalUrl,
+    method: req.method,
+    ip: req.ip,
+  });
+
+  res.status(500).json({ message: "Internal Server Error" });
+};
+
+process.on("uncaughtException", (err) => {
+  logger.error("Uncaught Exception", err);
+});
+
+process.on("unhandledRejection", (reason) => {
+  logger.error("Unhandled Rejection", reason);
+});
+
+app.get("/hasPermission/:name", (req, res) => {
+  if (!req.isAuthenticated()) {
+    return res.json({ allowed: false });
+  }
+
+  const userId = req.user.user_id;
+  const permissionName = req.params.name;
+
+  const sql = `
+    SELECT COUNT(*) AS count
+    FROM permission p
+    JOIN role_permission rp ON rp.permission_id = p.id
+    JOIN user_role ur ON ur.role_id = rp.role_id
+    JOIN userregistration u ON u.id = ur.user_id
+    WHERE u.user_id = ? AND p.name = ?
+  `;
+
+  req.db.query(sql, [userId, permissionName], (err, result) => {
+    if (err) return res.json({ allowed: false });
+    res.json({ allowed: result[0].count > 0 });
+  });
+});
+
+app.get("/getUserRegistration", checkPermission("user_view"), (req, res) => {
+  req.db.query("SELECT * FROM userregistration", (err, results) => {
+    if (err) {
+      console.error("Error fetching registration data:", err);
+      return;
+    }
+    console.log(results);
+    res.json(results);
+    console.log("Registration records fetched successfully");
+  });
+});
+
+app.post("/addUserRegistration", checkPermission("user_create"), (req, res) => {
+  const { user_id, password, email_id } = req.body;
+  const sql =
+    "INSERT INTO userregistration (user_id,email_id, password) VALUES (?,?,?)";
+
+  let hash = crypto.createHash("sha512").update(password).digest("hex");
+
+  req.db.query(sql, [user_id, email_id, hash], (err, result) => {
+    if (err) {
+      if (err.code === "ER_DUP_ENTRY") {
+        return res.status(400).json({ error: "User already exists" });
+      }
+      return res.status(500).json({
+        error: "registration will failed please fill correct proper field",
+      });
+    }
+    res.redirect("/login.html");
+  });
+});
+
+app.get("/getMaterial", checkPermission("material_view"), (req, res) => {
+  req.db.query("SELECT * FROM material", (err, results) => {
+    if (err) {
+      console.error("Error fetching material data:", err);
+      logger.error("DB error in /getMaterial", err);
+      res.status(500).json({
+        status: "error 500",
+        message:
+          "Oops! Something went wrong while fetching materials. Please try again later.",
+      });
+      return;
+    }
+    console.log(results);
+    res.json(results);
+    console.log("Material records fetched successfully");
+  });
+});
+
+app.get(
+  "/getMaterialById/:id",
+  checkPermission("material_view"),
+  (req, res) => {
+    const materialId = req.params.id;
+    req.db.query(
+      "SELECT * FROM material where id=?",
+      [materialId],
+      (err, result) => {
+        if (err) {
+          console.error("Error fetching material data by Id:", err);
+          logger.error("DB error in /getMaterialById/:id", err);
+          res.status(500).json({ error: "Internal Server Error" });
+          return;
+        }
+        console.log(result);
+        res.json(result);
+        console.log("Material record fetched successfully");
+      },
+    );
+  },
+);
+
+app.post("/addMaterial", checkPermission("material_create"), (req, res) => {
+  const { name, quantity_of_measure, unit_quantity } = req.body;
+  const query =
+    "INSERT INTO material (name, quantity_of_measure, unit_quantity) VALUES (?, ?, ?)";
+  req.db.query(
+    query,
+    [name, quantity_of_measure, unit_quantity],
+    (err, results) => {
+      if (err) {
+        console.error("Error adding material:", err);
+        logger.error("DB error in /addMaterial", err);
+        return res.status(500).json({ error: "Internal server error" });
+      }
+      console.log("Material added successfully:", results);
+      res.status(201).json({ message: "Material added successfully" });
+    },
+  );
+});
+
+app.put(
+  "/updateMaterial/:id",
+  checkPermission("material_update"),
+  (req, res) => {
+    const materialId = req.params.id;
+    const { name, quantity_of_measure, unit_quantity } = req.body;
+    req.db.query(
+      "UPDATE material SET name=?, quantity_of_measure=?, unit_quantity=? WHERE id=?",
+      [name, quantity_of_measure, unit_quantity, materialId],
+      (err, results) => {
+        if (err) {
+          console.error("Error updating data:", err);
+          logger.error("DB error in /updateMaterial/:id", err);
+          res.status(500).send({ error: "Internal Server Error" });
+          return;
+        }
+        console.log("Record updated successfully");
+        res.status(200).send({ name, quantity_of_measure, unit_quantity });
+      },
+    );
+  },
+);
+
+app.delete(
+  "/deleteMaterial/:id",
+  checkPermission("material_delete"),
+  (req, res) => {
+    const materialId = req.params.id;
+    req.db.query(
+      "DELETE FROM material WHERE id = ?",
+      [materialId],
+      (err, results) => {
+        if (err) {
+          console.error("Error deleting data:", err);
+          logger.error("DB error in /deleteMaterial/:id", err);
+          res.status(500).send({ error: "Internal Server Error" });
+          return;
+        }
+        console.log("Record deleted successfully");
+        res.status(200).send({ message: "Material deleted successfully" });
+      },
+    );
+  },
+);
+
+app.get("/getVender", checkPermission("vendor_view"), (req, res) => {
+  req.db.query("SELECT * FROM vender", (err, results) => {
+    if (err) {
+      console.error("Error fetching vender data:", err);
+      logger.error("DB error in /getVender", err);
+      res.status(500).json({ error: "Internal Server Error" });
+      return;
+    }
+    console.log(results);
+    res.json(results);
+    console.log("vender records fetched successfully");
+  });
+});
+
+app.get("/getVenderById/:id", checkPermission("vendor_view"), (req, res) => {
+  const materialId = req.params.id;
+  req.db.query(
+    "SELECT * FROM vender where id=?",
+    [materialId],
+    (err, result) => {
+      if (err) {
+        console.error("Error fetching vender data by Id:", err);
+        logger.error("DB error in /getVenderById/:id", err);
+        res.status(500).json({ error: "Internal Server Error" });
+        return;
+      }
+      console.log(result);
+      res.json(result);
+      console.log("vender record fetched successfully");
+    },
+  );
+});
+
+app.post("/addVender", checkPermission("vendor_create"), (req, res) => {
+  const { name, phone_no, address } = req.body;
+  const query = "INSERT INTO vender (name, phone_no, address) VALUES (?, ?, ?)";
+  req.db.query(query, [name, phone_no, address], (err, results) => {
+    if (err) {
+      console.error("Error adding vender:", err);
+      logger.error("DB error in /addVender", err);
+      return res.status(500).json({ error: "Internal server error" });
+    }
+    console.log("vender added successfully:", results);
+    res.status(201).json({ message: "vender added successfully" });
+  });
+});
+
+app.put("/updateVender/:id", checkPermission("vendor_update"), (req, res) => {
+  const venderId = req.params.id;
+  const { name, phone_no, address } = req.body;
+  req.db.query(
+    "UPDATE vender SET name=?, phone_no=?, address=? WHERE id=?",
+    [name, phone_no, address, venderId],
+    (err, results) => {
+      if (err) {
+        console.error("Error updating data:", err);
+        logger.error("DB error in /updateVender/:id", err);
+        res.status(500).send({ error: "Internal Server Error" });
+        return;
+      }
+      console.log("Record updated successfully");
+      res.status(200).send({ name, phone_no, address });
+    },
+  );
+});
+
+app.delete(
+  "/deleteVender/:id",
+  checkPermission("vendor_delete"),
+  (req, res) => {
+    const venderId = req.params.id;
+    req.db.query(
+      "DELETE FROM vender WHERE id = ?",
+      [venderId],
+      (err, results) => {
+        if (err) {
+          console.error("Error deleting data:", err);
+          logger.error("DB error in /deleteVender/:id", err);
+          res.status(500).send({ error: "Internal Server Error" });
+          return;
+        }
+        console.log("Record deleted successfully");
+        res.status(200).send({ message: "vender deleted successfully" });
+      },
+    );
+  },
+);
+
+app.get(
+  "/getVenderMaterial",
+  checkPermission("vendor_material_view"),
+  (req, res) => {
+    req.db.query("SELECT * FROM vender_material", (err, results) => {
+      if (err) {
+        console.error("Error fetching vender material data:", err);
+        logger.error("DB error in /getVenderMaterial", err);
+        res.status(500).json({ error: "Internal Server Error" });
+        return;
+      }
+      console.log(results);
+      res.json(results);
+      console.log("vender material records fetched successfully");
+    });
+  },
+);
+
+app.get(
+  "/getVenderMetrialById/:id",
+  checkPermission("vendor_material_view"),
+  (req, res) => {
+    const materialId = req.params.id;
+    req.db.query(
+      "SELECT * FROM vender_material where id=?",
+      [materialId],
+      (err, result) => {
+        if (err) {
+          console.error("Error fetching material data by Id:", err);
+          logger.error("DB error in /getVenderMetrialById/:id", err);
+          res.status(500).json({ error: "Internal Server Error" });
+          return;
+        }
+        console.log(result);
+        res.json(result);
+        console.log("Material record fetched successfully");
+      },
+    );
+  },
+);
+
+app.get(
+  "/getVenderMaterialUsingVenderId/:id",
+  checkPermission("vendor_material_view"),
+  (req, res) => {
+    const venderId = req.params.id;
+
+    req.db.query(
+      "SELECT vm.id,v.id AS vender_id,v.name AS vender_name,m.id AS material_id,m.name AS material_name,vm.price FROM vender_material vm JOIN vender v ON vm.vendor_id = v.id JOIN material m ON vm.material_id = m.id WHERE v.id = ?",
+      [venderId],
+      (err, result) => {
+        if (err) {
+          console.error("Error fetching vender material data:", err);
+          logger.error("DB error in /getVenderMaterialUsingVenderId/:id", err);
+          res.status(500).json({ error: "Internal Server Error" });
+          return;
+        }
+        console.log(result);
+        res.json(result);
+        console.log("vender material records fetched successfully");
+      },
+    );
+  },
+);
+
+app.post(
+  "/addVenderMaterial",
+  checkPermission("vendor_material_add"),
+  (req, res) => {
+    const { material_id, vendor_id, price } = req.body;
+    const query =
+      "INSERT INTO vender_material (material_id, vendor_id, price) VALUES (?, ?, ?)";
+    req.db.query(query, [material_id, vendor_id, price], (err, results) => {
+      if (err) {
+        console.error("Error adding vender material:", err);
+        logger.error("DB error in /addVenderMaterial", err);
+        return res.status(500).json({ error: "Internal server error" });
+      }
+      console.log("vender material added successfully:", results);
+      res.status(201).json({ message: "vender material added successfully" });
+    });
+  },
+);
+
+app.put(
+  "/updateVenderMaterial/:id",
+  checkPermission("vendor_material_add"),
+  (req, res) => {
+    const venderMaterialId = req.params.id;
+    const { material_id, vendor_id, price } = req.body;
+    req.db.query(
+      "UPDATE vender_material SET material_id=?, vendor_id=?, price=? WHERE id=?",
+      [material_id, vendor_id, price, venderMaterialId],
+      (err, results) => {
+        if (err) {
+          console.error("Error updating data:", err);
+          logger.error("DB error in /updateVenderMaterial/:id", err);
+          res.status(500).send({ error: "Internal Server Error" });
+          return;
+        }
+        console.log("Record updated successfully");
+        res.status(200).send({ material_id, vendor_id, price });
+      },
+    );
+  },
+);
+
+app.put(
+  "/updateAVenderMaterial/:id",
+  checkPermission("vendor_material_add"),
+  (req, res) => {
+    const venderMaterialId = req.params.id;
+    const { price } = req.body;
+    req.db.query(
+      "UPDATE vender_material SET price=? WHERE id=?",
+      [price, venderMaterialId],
+      (err, results) => {
+        if (err) {
+          console.error("Error updating data:", err);
+          logger.error("DB error in /updateAVenderMaterial/:id", err);
+          res.status(500).send({ error: "Internal Server Error" });
+          return;
+        }
+        console.log("Record updated successfully");
+        res.status(200).send({ price });
+      },
+    );
+  },
+);
+
+app.delete(
+  "/deleteVendermaterial/:id",
+  checkPermission("vendor_material_remove"),
+  (req, res) => {
+    const venderMaterialId = req.params.id;
+    req.db.query(
+      "DELETE FROM vender_material WHERE id = ?",
+      [venderMaterialId],
+      (err, results) => {
+        if (err) {
+          console.error("Error deleting data:", err);
+          logger.error("DB error in /deleteVendermaterial/:id", err);
+          res.status(500).send({ error: "Internal Server Error" });
+          return;
+        }
+        console.log("Record deleted successfully");
+        res
+          .status(200)
+          .send({ message: "vender material deleted successfully" });
+      },
+    );
+  },
+);
+
+app.get("/getVenderBill", checkPermission("vendor_bill_view"), (req, res) => {
+  req.db.query("SELECT * FROM vender_bill", (err, results) => {
+    if (err) {
+      console.error("Error fetching vender bill data:", err);
+      logger.error("DB error in /getVenderBill", err);
+      // res.status(500).json({ error: "Internal Server Error" });
+      return;
+    }
+    console.log(results);
+    res.json(results);
+    console.log("vender bill records fetched successfully");
+  });
+});
+
+app.get(
+  `/getAVenderBillById/:id`,
+  checkPermission("vendor_bill_view"),
+  (req, res) => {
+    const venderbillId = req.params.id;
+    req.db.query(
+      "SELECT * FROM vender_bill where id=?",
+      [venderbillId],
+      (err, results) => {
+        if (err) {
+          console.error("Error fetching vender bill data:", err);
+          logger.error("DB error in /getAVenderBillById/:id", err);
+          res.status(500).json({ error: "Internal Server Error" });
+          return;
+        }
+        console.log(results);
+        res.json(results);
+        console.log("vender bill record fetched successfully");
+      },
+    );
+  },
+);
+
+app.post(
+  "/addVenderBill",
+  checkPermission("vendor_bill_create"),
+  (req, res) => {
+    const { vendor_id, date, bill_status, total_amount, paid_amount } =
+      req.body;
+    const query =
+      "INSERT INTO vender_bill (vendor_id, date, bill_status,total_amount,paid_amount) VALUES (?, ?, ?, ?, ?)";
+    req.db.query(
+      query,
+      [vendor_id, date, bill_status, total_amount, paid_amount],
+      (err, results) => {
+        if (err) {
+          console.error("Error adding vender bill:", err);
+          logger.error("DB error in /addVenderBill", err);
+          return res.status(500).json({ error: "Internal server error" });
+        }
+        console.log("vender bill added successfully:", results);
+        res.status(201).json({
+          message: "vender bill added successfully",
+          vender_bill_id: results.insertId,
+        });
+      },
+    );
+  },
+);
+
+app.put(
+  "/updateVenderBill/:id",
+  checkPermission("vendor_bill_update"),
+  (req, res) => {
+    const { id } = req.params;
+    const { vendor_id, date, total_amount, paid_amount, bill_status } =
+      req.body;
+
+    if (
+      !vendor_id ||
+      !date ||
+      total_amount === undefined ||
+      paid_amount === undefined ||
+      !bill_status
+    ) {
+      logger.warn("Invalid input data in /updateVenderBill/:id");
+      return res.status(400).json({ message: "Invalid input data" });
+    }
+
+    const sql = `
+    UPDATE vender_bill
+    SET vendor_id = ?, date = ?, total_amount = ?, paid_amount = ?, bill_status = ?
+    WHERE id = ?
+  `;
+
+    req.db.query(
+      sql,
+      [vendor_id, date, total_amount, paid_amount, bill_status, id],
+      (err, result) => {
+        if (err) {
+          console.error("DB ERROR:", err);
+          logger.error("DB error in /updateVenderBill/:id", err);
+          return res.status(500).json({ message: "Database error" });
+        }
+
+        res.json({ success: true });
+      },
+    );
+  },
+);
+
+app.delete(
+  "/deleteVenderBill/:id",
+  checkPermission("vendor_bill_delete"),
+  (req, res) => {
+    const venderBillId = req.params.id;
+    req.db.query(
+      "DELETE FROM vender_bill WHERE id = ?",
+      [venderBillId],
+      (err, results) => {
+        if (err) {
+          console.error("Error deleting data:", err);
+          logger.error("DB error in /deleteVenderBill/:id", err);
+          res.status(500).send({ error: "Internal Server Error" });
+          return;
+        }
+        console.log("Record deleted successfully");
+        res.status(200).send({ message: "vender Bill deleted successfully" });
+      },
+    );
+  },
+);
+
+app.get(
+  "/getVenderBillItem",
+  checkPermission("vendor_bill_item_view"),
+  (req, res) => {
+    req.db.query("SELECT * FROM vender_bill_item", (err, results) => {
+      if (err) {
+        console.error("Error fetching vender bill item data:", err);
+        logger.error("DB error in /getVenderBillItem", err);
+        res.status(500).json({ error: "Internal Server Error" });
+        return;
+      }
+      console.log(results);
+      res.json(results);
+      console.log("vender bill Item records fetched successfully");
+    });
+  },
+);
+
+app.get(
+  "/getAVenderBillItemByVenderBillId/:id",
+  checkPermission("vendor_bill_item_view"),
+  (req, res) => {
+    const venderBillItemId = req.params.id;
+
+    req.db.query(
+      " select vbi.id,vbi.vender_bill_id,vbi.material_id,vbi.price,vbi.quantity,vbi.sub_total,m.name as material_name from vender_bill_item vbi join material m on vbi.material_id= m.id where vbi.vender_bill_id=?;",
+      [venderBillItemId],
+      (err, results) => {
+        if (err) {
+          console.error("Error fetching vender bill item data:", err);
+          logger.error(
+            "DB error in /getAVenderBillItemByVenderBillId/:id",
+            err,
+          );
+          res.status(500).json({ error: "Internal Server Error" });
+          return;
+        }
+        console.log(results);
+        res.json(results);
+        console.log("vender bill Item record fetched successfully");
+      },
+    );
+  },
+);
+
+app.post(
+  "/addVenderBillItem",
+  checkPermission("vendor_bill_item_add"),
+  (req, res) => {
+    const { vender_bill_id, material_id, price, quantity, sub_total } =
+      req.body;
+    const query =
+      "INSERT INTO vender_bill_item (vender_bill_id, material_id, price,quantity,sub_total) VALUES (?, ?, ?,?,?)";
+    req.db.query(
+      query,
+      [vender_bill_id, material_id, price, quantity, sub_total],
+      (err, results) => {
+        if (err) {
+          console.error("Error adding vender bill Item:", err);
+          logger.error("DB error in /addVenderBillItem", err);
+          return res.status(500).json({ error: "Internal server error" });
+        }
+        console.log("vender bill item added successfully:", results);
+        res
+          .status(201)
+          .json({ message: "vender bill item added successfully" });
+      },
+    );
+  },
+);
+
+app.post(
+  "/addMultipleVenderBillItem",
+  checkPermission("vendor_bill_item_add"),
+  (req, res) => {
+    const { vender_bill_id, items } = req.body;
+
+    if (!vender_bill_id || !items || items.length === 0) {
+      logger.warn("Invalid input data in /addMultipleVenderBillItem");
+      return res.status(400).json({ message: "Invalid data" });
+    }
+
+    const values = items.map((item) => [
+      vender_bill_id,
+      item.material_id,
+      item.price,
+      item.quantity,
+      item.sub_total,
+    ]);
+
+    const sql = `
+    INSERT INTO vender_bill_item (vender_bill_id, material_id, price,quantity,sub_total) VALUES ?`;
+
+    req.db.query(sql, [values], (err, result) => {
+      if (err) {
+        console.error(err);
+        logger.error("DB error in /addMultipleVenderBillItem", err);
+        return res.status(500).json({ message: "Insert failed" });
+      }
+
+      res.json({ success: true, inserted: result.affectedRows });
+    });
+  },
+);
+
+app.put(
+  "/updateVenderBillItem/:id",
+  checkPermission("vendor_bill_item_update"),
+  (req, res) => {
+    const venderBillItemId = req.params.id;
+    const { vender_bill_id, material_id, price, quantity, sub_total } =
+      req.body;
+    req.db.query(
+      "UPDATE vender_bill_item SET vender_bill_id=?, material_id=?, price=?, quantity=?, sub_total=? WHERE id=?",
+      [
+        vender_bill_id,
+        material_id,
+        price,
+        quantity,
+        sub_total,
+        venderBillItemId,
+      ],
+      (err, results) => {
+        if (err) {
+          console.error("Error updating data:", err);
+          logger.error("DB error in /updateVenderBillItem/:id", err);
+          res.status(500).send({ error: "Internal Server Error" });
+          return;
+        }
+        console.log("Record updated successfully");
+        res.status(200).send({ vendor_id, date, status });
+      },
+    );
+  },
+);
+
+app.delete(
+  "/deleteVenderBillItem/:id",
+  checkPermission("vendor_bill_item_delete"),
+  (req, res) => {
+    const venderBillItemId = req.params.id;
+    req.db.query(
+      "DELETE FROM vender_bill_item WHERE id = ?",
+      [venderBillItemId],
+      (err, results) => {
+        if (err) {
+          console.error("Error deleting data:", err);
+          logger.error("DB error in /deleteVenderBillItem/:id", err);
+          res.status(500).send({ error: "Internal Server Error" });
+          return;
+        }
+        console.log("Record deleted successfully");
+        res
+          .status(200)
+          .send({ message: "vender Bill item deleted successfully" });
+      },
+    );
+  },
+);
+
+connectToServer()
+  .then(() => {
+    console.log("Mongodb connect successfully");
+  })
+  .catch((err) => {
+    console.error(
+      "Failed to start server due to database connection error:",
+      err,
+    );
+    process.exit(1);
+  });
+
+app.listen(port, () => {
+  console.log(`Server is running on http://localhost:${port}`);
+});
+
+app.use((req, res, next) => {
+  res.status(404).sendFile(path.join(__dirname, "public", "404.html"));
+});
+
+app.use(errorLogger);
+
+export default app;

@@ -1,0 +1,37 @@
+{
+  "name": "shop_expenses",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "index.js",
+  "scripts": {
+    "test": "cross-env NODE_OPTIONS=--experimental-modules jest --runInBand"
+  },
+  "author": "logesh",
+  "license": "ISC",
+  "description": "",
+  "dependencies": {
+    "bcrypt": "^6.0.0",
+    "body-parser": "^2.2.2",
+    "dotenv": "^17.2.3",
+    "express-async-handler": "^1.2.0",
+    "express-session": "^1.18.2",
+    "module": "^2.0.0",
+    "mongodb": "^7.1.0",
+    "mongoose": "^9.1.6",
+    "morgan": "^1.10.1",
+    "mysql": "^2.18.1",
+    "passport": "^0.7.0",
+    "passport-facebook": "^3.0.0",
+    "passport-google-oauth2": "^0.2.0",
+    "passport-local": "^1.0.0",
+    "winston": "^3.19.0",
+    "winston-daily-rotate-file": "^5.0.0"
+  },
+  "devDependencies": {
+    "cross-env": "^10.1.0",
+    "express": "^5.2.1",
+    "jsonwebtoken": "^9.0.3",
+    "supertest": "^7.2.2",
+    "vitest": "^4.0.18"
+  }
+}
